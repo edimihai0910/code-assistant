@@ -2,6 +2,8 @@
 
 A local AI assistant that reads your entire codebase and helps you understand it through natural language questions. Everything runs **100% locally** — no code leaves your machine.
 
+Supports **Java**, **.NET/C#**, and **Python** projects with automatic language detection.
+
 ---
 
 ## 🎯 What does it do?
@@ -10,6 +12,7 @@ A local AI assistant that reads your entire codebase and helps you understand it
 - **Answers questions** about the project: architecture, data flow, classes, dependencies
 - **Detects changes** when you pull new code and explains what's different
 - **Two smart modes**: overview questions (big picture) vs. specific questions (single file/class)
+- **Language-aware chunking**: understands Java/C#/Python code structure for better accuracy
 
 ---
 
@@ -111,10 +114,10 @@ code-assistant/
 ├── chroma_db/             # Vector database (auto-generated after ingest)
 ├── changelogs/            # Update history (auto-generated after updates)
 ├── index_state.json       # File tracking state (auto-generated)
+├── config.py              # Language profiles (Java, .NET, Python)
 ├── ingest.py              # 🔨 Initial full indexing of codebase
 ├── update.py              # 🔄 Incremental smart update
 ├── query.py               # 💬 Interactive Q&A interface
-├── requirements.txt       # Python dependencies
 └── README.md              # This file
 ```
 
@@ -122,7 +125,9 @@ code-assistant/
 
 ## 🔧 Configuration
 
-Before running, edit the **codebase path** in `ingest.py` and `query.py`:
+### Point to your codebase
+
+Open **`ingest.py`** AND **`query.py`** and change the path at the top:
 
 ```python
 CODEBASE_PATH = r"C:\path\to\your\project"  # ← change this
@@ -130,25 +135,25 @@ CODEBASE_PATH = r"C:\path\to\your\project"  # ← change this
 
 > 💡 Use `r"..."` (raw string) on Windows to avoid backslash issues.
 
-If your project uses a different language than .NET/C#, adjust the file extensions in `INCLUDE_EXTENSIONS`:
+### Language profile (auto-detected)
+
+The assistant auto-detects your project type based on build files:
+
+| Detected language | Triggered by these files |
+|---|---|
+| **Java** | `pom.xml`, `build.gradle`, `build.gradle.kts` |
+| **.NET / C#** | `*.sln`, `*.csproj` |
+| **Python** | `pyproject.toml`, `setup.py`, `requirements.txt` |
+
+To force a specific profile, set `PROFILE_OVERRIDE` in both `ingest.py` and `query.py`:
 
 ```python
-INCLUDE_EXTENSIONS = {
-    # .NET / C#
-    ".cs", ".cshtml", ".razor", ".xaml",
-    ".csproj", ".sln", ".props", ".targets",
-    # Config
-    ".json", ".xml", ".yaml", ".yml", ".config",
-    # Database
-    ".sql",
-    # Frontend
-    ".js", ".ts", ".jsx", ".tsx", ".css", ".html",
-    # Docs
-    ".md", ".txt", ".rst",
-}
+PROFILE_OVERRIDE = "java"   # or "dotnet" or "python"  (None = auto-detect)
 ```
 
-If you chose a different model than `qwen2.5-coder:14b`, update it in `query.py`:
+### Change the LLM model (optional)
+
+In `query.py`, if you chose a different model:
 
 ```python
 llm = OllamaLLM(
@@ -173,10 +178,11 @@ python ingest.py
 
 Expected output:
 ```
-📂 Scanning files...
-✅ Found 47 relevant files
-✅ Loaded 46 files (1 skipped due to errors)
-✅ Split into 230 chunks
+✅ Auto-detected profile: java
+📂 Scanning files (profile: java)...
+✅ Found 247 relevant files
+✅ Loaded 245 files (2 skipped due to errors)
+✅ Split into 1823 chunks (language: java)
 🔢 Creating embeddings (this may take a while)...
 ✅ Done! Indexed in ./chroma_db
 ```
@@ -191,9 +197,9 @@ python query.py
 🤖 Code Assistant ready! (type 'exit' to quit)
 
 ❓ You: Explain the project architecture and main components
-❓ You: How does the RabbitMQ message flow work, step by step?
+❓ You: How does the HTTP request flow work, step by step?
 ❓ You: What design patterns are used in this project?
-❓ You: What does AlertPopupForm do and who calls it?
+❓ You: What does UserService do and who calls it?
 ❓ You: exit
 ```
 
@@ -219,6 +225,73 @@ Then in `query.py` you can ask:
 
 ---
 
+## 🔄 Switching Between Projects
+
+> ⚠️ **This is important!** The assistant keeps **one codebase indexed at a time**. When you switch projects, you MUST reset the index — otherwise you'll get mixed/wrong answers from both codebases.
+
+### ✅ Clean switch procedure (always do all 4 steps)
+
+```bash
+# 1. Delete the old vector database
+# Windows:
+rmdir /s /q chroma_db
+# Linux/macOS:
+rm -rf chroma_db
+
+# 2. Delete the update tracking state (so the new project starts fresh)
+# Windows:
+del index_state.json
+# Linux/macOS:
+rm -f index_state.json
+
+# 3. (Optional) Delete old changelogs
+# Windows:
+rmdir /s /q changelogs
+# Linux/macOS:
+rm -rf changelogs
+
+# 4. Update CODEBASE_PATH in ingest.py AND query.py
+#    Then re-index:
+python ingest.py
+```
+
+### One-liner for Windows PowerShell
+
+```powershell
+Remove-Item -Recurse -Force chroma_db, changelogs, index_state.json -ErrorAction SilentlyContinue
+```
+
+### One-liner for Linux/macOS
+
+```bash
+rm -rf chroma_db changelogs index_state.json
+```
+
+---
+
+## 🧹 When You MUST Re-index (Delete `chroma_db/`)
+
+| Situation | Action required |
+|---|---|
+| 🔀 **Switched to a different project** | Full reset (all 4 steps above) |
+| 🔄 Pulled a few new files into the same project | Just run `python update.py` |
+| 🏗️ Major refactor or branch switch (same project) | Delete `chroma_db/`, run `ingest.py` |
+| ⚙️ Changed `INCLUDE_EXTENSIONS` or chunk settings | Delete `chroma_db/`, run `ingest.py` |
+| 🤔 Answers feel wrong or mixed with old data | Full reset, then `ingest.py` |
+| 🧠 Changed the embedding model in Ollama | Full reset, then `ingest.py` |
+| 🎯 Changed `PROFILE_OVERRIDE` (e.g., Java → .NET) | Full reset, then `ingest.py` |
+
+### What each auto-generated item contains
+
+| File/Folder | Purpose | Safe to delete? |
+|---|---|---|
+| `chroma_db/` | Vector embeddings of your code | ✅ Yes — rebuilt by `ingest.py` |
+| `index_state.json` | Tracks file modification times for incremental updates | ✅ Yes — rebuilt by `update.py` |
+| `changelogs/` | Human-readable history of code changes | ✅ Yes — purely informational |
+| `venv/` | Python packages | ⚠️ Only if you want to reinstall everything |
+
+---
+
 ## 💡 Tips for Best Results
 
 ### Good questions to start with
@@ -226,31 +299,20 @@ Then in `query.py` you can ask:
 | Goal | Question |
 |---|---|
 | Big picture | *"Explain the project structure, architecture, and main components"* |
-| Tech stack | *"What frameworks, libraries, and NuGet packages are used?"* |
-| Entry point | *"How does the application start? Trace from Program.cs"* |
-| Data flow | *"How does a message flow from RabbitMQ to the UI? Include method names"* |
-| Specific class | *"What does RabbitMQService do? List all its public methods and events"* |
-| Dependencies | *"What depends on AudioService? Who calls its methods?"* |
+| Tech stack | *"What frameworks and libraries are used? Check the build files"* |
+| Entry point | *"How does the application start? Trace the initialization flow"* |
+| Data flow | *"How does a request flow through the system? Include class and method names"* |
+| Specific class | *"What does UserService do? List all its public methods"* |
+| Dependencies | *"What depends on AuthService? Who calls its methods?"* |
 | Patterns | *"What design patterns are used? Give examples with file names"* |
-| Testing | *"How is the project tested? What test frameworks are used?"* |
+| Testing | *"How is the project tested? What test frameworks and patterns?"* |
 
 ### Pro tips
 
 - **Be specific** — *"What does method X in class Y do?"* works better than *"explain the code"*
 - **Ask follow-ups** — dig deeper into anything interesting
 - **Ask for diagrams** — *"Generate a Mermaid diagram of the architecture"*
-- **Reference files** — *"Explain RabbitMQService.cs line by line"*
-
----
-
-## 🔄 Re-indexing
-
-| Situation | What to do |
-|---|---|
-| Pulled a few new files | `python update.py` |
-| Major refactor or branch switch | Delete `chroma_db/` folder, then `python ingest.py` |
-| Changed indexing settings | Delete `chroma_db/` folder, then `python ingest.py` |
-| Something feels off | Delete `chroma_db/` and `index_state.json`, then `python ingest.py` |
+- **Reference files** — *"Explain UserService.java line by line"*
 
 ---
 
@@ -279,12 +341,14 @@ Look for `GPU` in the `PROCESSOR` column. If it says `CPU` and you have an NVIDI
 |---|---|
 | `ModuleNotFoundError` | Make sure venv is activated: `.\venv\Scripts\activate.bat` |
 | `ollama: command not found` | Restart terminal after installing Ollama |
-| Model download stuck | Re-run `ollama pull <model>` — it resumes |
+| Model download stuck | Re-run `ollama pull <model>` — it resumes automatically |
 | Empty/vague answers | Delete `chroma_db/`, re-run `python ingest.py` |
+| **Answers mention files from an old project** | You forgot to reset when switching projects! See "Switching Between Projects" above |
 | Very slow responses | Check `ollama ps` for GPU usage; try a smaller model |
 | `SyntaxWarning: invalid escape sequence` | Use raw strings: `r"C:\path\to\project"` |
 | PowerShell ExecutionPolicy error | `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` |
-| `Connection refused` on Ollama | Make sure Ollama is running: `ollama serve` |
+| `Connection refused` on Ollama | Make sure Ollama is running (check system tray on Windows) |
+| Wrong language detected | Set `PROFILE_OVERRIDE = "java"` (or `"dotnet"` / `"python"`) manually |
 
 ---
 
@@ -297,7 +361,7 @@ Look for `GPU` in the `PROCESSOR` column. If it says `CPU` and you have an NVIDI
 | `langchain-community` | Community integrations (file loaders) |
 | `langchain-ollama` | Ollama integration (local LLM + embeddings) |
 | `langchain-chroma` | ChromaDB vector store integration |
-| `langchain-text-splitters` | Intelligent code/text chunking |
+| `langchain-text-splitters` | Language-aware code chunking |
 | `chromadb` | Local vector database |
 | `sentence-transformers` | Embedding model support |
 
@@ -324,11 +388,50 @@ Look for `GPU` in the `PROCESSOR` column. If it says `CPU` and you have an NVIDI
                                     └─────────────┘
 ```
 
-1. **Ingest**: Code files are split into chunks and converted to vectors (embeddings)
+1. **Ingest**: Code files are split into chunks (respecting code structure) and converted to vectors
 2. **Query**: Your question is also converted to a vector
 3. **Search**: The most similar code chunks are retrieved from the vector DB
 4. **Answer**: The LLM reads those chunks + your question and generates an answer
 
 ---
 
+## 📝 Quick Reference — Common Workflows
+
+### Index a new project from scratch
+```bash
+.\venv\Scripts\activate.bat
+# Update CODEBASE_PATH in ingest.py and query.py
+python ingest.py
+python query.py
+```
+
+### Switch from project A to project B
+```bash
+.\venv\Scripts\activate.bat
+rmdir /s /q chroma_db
+del index_state.json
+rmdir /s /q changelogs
+# Update CODEBASE_PATH in ingest.py and query.py
+python ingest.py
+python query.py
+```
+
+### Daily work — after `git pull`
+```bash
+.\venv\Scripts\activate.bat
+python update.py
+python query.py
+```
+
+### Something feels wrong — full reset
+```bash
+.\venv\Scripts\activate.bat
+rmdir /s /q chroma_db changelogs
+del index_state.json
+python ingest.py
+```
+
+---
+
+*Built with ❤️ using Ollama, LangChain, and ChromaDB — 100% local, 100% private.*
 `
