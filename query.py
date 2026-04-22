@@ -5,143 +5,117 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-
-DB_PATH = "./chroma_db"
-CODEBASE_PATH = r"C:\Cabis\Hungary\HIFS Mid Alarm"
-
-EXCLUDE_DIRS = {
-    "bin", "obj", "node_modules", ".git", ".vs", ".vscode",
-    "packages", "TestResults", "Debug", "Release", ".nuget"
-}
+from config import get_profile
 
 # ─────────────────────────────────────────────
-# 1. Generează o hartă a proiectului (tree)
+# CONFIG
+# ─────────────────────────────────────────────
+CODEBASE_PATH = r"C:\Cabis\Hungary\HIFS Mid Alarm"
+DB_PATH = "./chroma_db"
+PROFILE_OVERRIDE = None  # or "java" / "dotnet" / "python"
+
+# ─────────────────────────────────────────────
+profile_name, profile = get_profile(CODEBASE_PATH, PROFILE_OVERRIDE)
+EXCLUDE_DIRS = profile["exclude_dirs"]
+KEY_PATTERNS = profile["key_patterns"]
+PROMPT_ROLE = profile["prompt_role"]
+TECH_HINTS = profile["tech_hints"]
+
+# ─────────────────────────────────────────────
+# Project map (same as before)
 # ─────────────────────────────────────────────
 def generate_project_map(codebase_path, max_depth=4):
-    """Creează un tree text al proiectului — foldere + fișiere."""
     lines = []
     base = Path(codebase_path)
-    
+    relevant_exts = profile["extensions"]
     for root, dirs, files in os.walk(codebase_path):
         dirs[:] = sorted([d for d in dirs if d not in EXCLUDE_DIRS])
         rel = Path(root).relative_to(base)
         depth = len(rel.parts)
-        
         if depth > max_depth:
             continue
-        
         indent = "  " * depth
         folder_name = rel.name if rel.name else base.name
         lines.append(f"{indent}📁 {folder_name}/")
-        
         for f in sorted(files):
-            ext = Path(f).suffix.lower()
-            if ext in {".cs", ".cshtml", ".razor", ".xaml", ".csproj", ".sln",
-                       ".json", ".xml", ".yaml", ".yml", ".config", ".sql",
-                       ".js", ".ts", ".css", ".html", ".md"}:
+            if Path(f).suffix.lower() in relevant_exts:
                 lines.append(f"{indent}  📄 {f}")
-    
     return "\n".join(lines)
 
-# ─────────────────────────────────────────────
-# 2. Extrage un rezumat din fișierele cheie
-# ─────────────────────────────────────────────
 def extract_key_files_summary(codebase_path, max_chars=3000):
-    """Citește primele N linii din fișierele cheie (.csproj, Program.cs, etc.)."""
-    key_patterns = [
-        "*.sln", "*.csproj", "Program.cs", "Startup.cs", "App.xaml.cs",
-        "appsettings.json", "App.config", "Web.config",
-        "README.md", "readme.md"
-    ]
-    
     summaries = []
     base = Path(codebase_path)
-    
-    for pattern in key_patterns:
+    for pattern in KEY_PATTERNS:
         for fpath in base.rglob(pattern):
-            # Skip excluded dirs
             if any(ex in fpath.parts for ex in EXCLUDE_DIRS):
                 continue
             try:
                 content = fpath.read_text(encoding="utf-8", errors="ignore")
                 rel = fpath.relative_to(base)
-                # Primele 80 linii sau max_chars
                 truncated = "\n".join(content.splitlines()[:80])[:max_chars]
                 summaries.append(f"--- {rel} ---\n{truncated}")
             except Exception:
                 pass
-    
     return "\n\n".join(summaries)[:12000]
 
 # ─────────────────────────────────────────────
-# 3. Setup vector store + LLM
+# LLM + retriever
 # ─────────────────────────────────────────────
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 vectorstore = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 22})  # mai multe chunks
-
-llm = OllamaLLM(
-    model="qwen2.5-coder:14b",
-    temperature=0.1,
-    num_ctx=32768
+retriever = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 20, "fetch_k": 40, "lambda_mult": 0.7}
 )
 
-# ─────────────────────────────────────────────
-# 4. Două moduri de prompt: overview vs. specific
-# ─────────────────────────────────────────────
+llm = OllamaLLM(model="qwen2.5-coder:14b", temperature=0.1, num_ctx=32768)
 
-# Prompt pentru întrebări GENERALE (overview, structură, "ce face proiectul")
-overview_template = """You are a senior .NET developer analyzing a codebase for the first time.
-You have access to the complete project structure and key configuration files, 
-plus relevant code snippets.
+# ─────────────────────────────────────────────
+# Prompts (language-aware!)
+# ─────────────────────────────────────────────
+overview_template = f"""You are a PRINCIPAL {PROMPT_ROLE} doing a thorough code review.
+Typical tech stack for this type of project: {TECH_HINTS}
 
-Be SPECIFIC and CONCRETE:
-- Name actual classes, namespaces, files, and folders
-- Describe actual data flow with real class/method names
-- Identify the tech stack, frameworks, NuGet packages
-- Explain the architecture pattern used (MVC, MVVM, layered, etc.)
-- List the main entry points and how the app starts
-- Describe inter-component communication (events, messaging, DI, etc.)
+RULES:
+- Be SPECIFIC: name exact classes, methods, files, packages
+- Cite the file for every claim: (File: xxx)
+- Number steps when describing flows, with class/method names at each step
+- Identify the actual frameworks and libraries used (from build files)
+- Call out patterns, anti-patterns, anything unusual
+- End with "Where I'd start reading" — 5 specific files ordered by priority
 
 PROJECT STRUCTURE:
-{project_map}
+{{project_map}}
 
-KEY FILES (csproj, config, Program.cs, etc.):
-{key_files}
+KEY FILES (build configs, entry points, etc.):
+{{key_files}}
 
-ADDITIONAL CODE SNIPPETS:
-{context}
+CODE SNIPPETS:
+{{context}}
 
-Question: {question}
+Question: {{question}}
 
-Provide a thorough, concrete answer with real names from the codebase:"""
+Give a thorough, concrete answer. Generic answers fail."""
 
-# Prompt pentru întrebări SPECIFICE (despre un fișier, o clasă, o funcție)
-specific_template = """You are a senior .NET developer analyzing a codebase.
-Use the following code snippets to answer the question precisely.
-Always reference actual file names, class names, method names.
-If you don't know, say so — don't make things up.
+specific_template = f"""You are a senior {PROMPT_ROLE}.
+Use these code snippets to answer precisely. Reference exact file/class/method names.
+If unsure, say so — don't invent.
 
 Code context:
-{context}
+{{context}}
 
-Question: {question}
+Question: {{question}}
 
 Answer:"""
 
 overview_prompt = ChatPromptTemplate.from_template(overview_template)
 specific_prompt = ChatPromptTemplate.from_template(specific_template)
 
-# ─────────────────────────────────────────────
-# 5. Helpers
-# ─────────────────────────────────────────────
 def format_docs(docs):
-    formatted = []
-    seen = set()
+    formatted, seen = [], set()
     for doc in docs:
         source = doc.metadata.get("source", "unknown")
         rel_path = os.path.relpath(source, CODEBASE_PATH)
-        # Evită duplicatele
         key = (rel_path, doc.page_content[:100])
         if key in seen:
             continue
@@ -149,73 +123,39 @@ def format_docs(docs):
         formatted.append(f"--- {rel_path} ---\n{doc.page_content}")
     return "\n\n".join(formatted)
 
-def is_overview_question(question):
-    """Detectează dacă întrebarea e despre proiect în general."""
-    overview_keywords = [
-        "project", "overview", "structure", "scope", "architecture",
-        "explain the", "what does this", "how does this project",
-        "first time", "understand", "learn", "big picture",
-        "what is this", "describe the", "how is it organized",
-        "entry point", "main components", "tech stack",
-        "proiect", "structur", "arhitectur", "scopul",
-    ]
-    q_lower = question.lower()
-    return any(kw in q_lower for kw in overview_keywords)
+def is_overview_question(q):
+    kws = ["project", "overview", "structure", "scope", "architecture",
+           "explain the", "what does this", "how does this project",
+           "first time", "understand", "learn", "big picture",
+           "proiect", "structur", "arhitectur"]
+    return any(k in q.lower() for k in kws)
 
-# Pre-generează harta proiectului (o singură dată)
 print("📂 Generating project map...")
 PROJECT_MAP = generate_project_map(CODEBASE_PATH)
 KEY_FILES = extract_key_files_summary(CODEBASE_PATH)
-print(f"✅ Project map ready ({PROJECT_MAP.count(chr(10))+1} entries)")
+print(f"✅ Ready (profile: {profile_name})\n")
 
-# ─────────────────────────────────────────────
-# 6. Loop interactiv
-# ─────────────────────────────────────────────
-print("\n🤖 Code Assistant ready! (type 'exit' to quit)")
-print("   💡 Tip: ask 'overview' questions or specific ones — I adapt!\n")
+print("🤖 Code Assistant ready! (type 'exit' to quit)\n")
 
 while True:
     question = input("❓ You: ")
     if question.lower().strip() in ("exit", "quit", "q"):
         break
+    print("\n🔍 Searching...\n")
+    source_docs = retriever.invoke(question)
+    context = format_docs(source_docs)
 
-    print("\n🔍 Searching codebase...\n")
-
-    # Decide modul
     if is_overview_question(question):
-        # MOD OVERVIEW — dă-i toată structura + key files + chunks
-        source_docs = retriever.invoke(question)
-        context = format_docs(source_docs)
-        
-        answer = (
-            overview_prompt 
-            | llm 
-            | StrOutputParser()
-        ).invoke({
-            "project_map": PROJECT_MAP,
-            "key_files": KEY_FILES,
-            "context": context,
-            "question": question
+        answer = (overview_prompt | llm | StrOutputParser()).invoke({
+            "project_map": PROJECT_MAP, "key_files": KEY_FILES,
+            "context": context, "question": question
         })
     else:
-        # MOD SPECIFIC — doar chunks relevante
-        source_docs = retriever.invoke(question)
-        context = format_docs(source_docs)
-        
-        answer = (
-            specific_prompt 
-            | llm 
-            | StrOutputParser()
-        ).invoke({
-            "context": context,
-            "question": question
+        answer = (specific_prompt | llm | StrOutputParser()).invoke({
+            "context": context, "question": question
         })
 
     print(f"💬 {answer}")
-
-    # Afișează sursele
-    sources = set()
-    for doc in source_docs:
-        src = os.path.relpath(doc.metadata.get("source", "?"), CODEBASE_PATH)
-        sources.add(src)
-    print(f"\n📎 Sources ({len(sources)} files): {', '.join(sorted(sources))}\n")
+    sources = set(os.path.relpath(d.metadata.get("source", "?"), CODEBASE_PATH)
+                  for d in source_docs)
+    print(f"\n📎 Sources ({len(sources)}): {', '.join(sorted(sources))}\n")
