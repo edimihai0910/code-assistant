@@ -4,22 +4,25 @@ from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
+from config import get_profile
 
-CODEBASE_PATH = r"C:\Cabis\Hungary\HIFS Mid Alarm"
+# ─────────────────────────────────────────────
+# CONFIG — schimbă doar asta!
+# ─────────────────────────────────────────────
+CODEBASE_PATH = r"FULL_PATH"
 DB_PATH = "./chroma_db"
 
-EXCLUDE_DIRS = {
-    "bin", "obj", "node_modules", ".git", ".vs", ".vscode",
-    "packages", "TestResults", "Debug", "Release", ".nuget"
-}
+# Opțional: force a profile ("java", "dotnet", "python")
+PROFILE_OVERRIDE = None
 
-INCLUDE_EXTENSIONS = {
-    ".cs", ".cshtml", ".razor", ".xaml",
-    ".csproj", ".sln", ".props", ".targets",
-    ".json", ".xml", ".yaml", ".yml", ".config",
-    ".sql", ".js", ".ts", ".jsx", ".tsx", ".css", ".html",
-    ".md", ".txt", ".rst",
-}
+# ─────────────────────────────────────────────
+# Setup based on profile
+# ─────────────────────────────────────────────
+profile_name, profile = get_profile(CODEBASE_PATH, PROFILE_OVERRIDE)
+
+EXCLUDE_DIRS = profile["exclude_dirs"]
+INCLUDE_EXTENSIONS = profile["extensions"]
+LANGUAGE = profile["language"]
 
 def should_include(file_path):
     path = Path(file_path)
@@ -34,8 +37,8 @@ def should_include(file_path):
         return False
     return True
 
-# 1. Scanează fișierele
-print("📂 Scanning files...")
+# 1. Scan
+print(f"📂 Scanning files (profile: {profile_name})...")
 all_files = []
 for root, dirs, files in os.walk(CODEBASE_PATH):
     dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
@@ -43,31 +46,30 @@ for root, dirs, files in os.walk(CODEBASE_PATH):
         full_path = os.path.join(root, f)
         if should_include(full_path):
             all_files.append(full_path)
-
 print(f"✅ Found {len(all_files)} relevant files")
 
-# 2. Încarcă fișierele
+# 2. Load
 docs = []
 failed = 0
 for fpath in all_files:
     try:
         loader = TextLoader(fpath, autodetect_encoding=True)
         docs.extend(loader.load())
-    except Exception as e:
+    except Exception:
         failed += 1
+print(f"✅ Loaded {len(docs)} files ({failed} skipped)")
 
-print(f"✅ Loaded {len(docs)} files ({failed} skipped due to errors)")
-
-# 3. Sparge în bucăți
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=2000,
-    chunk_overlap=200
+# 3. Smart chunking (language-aware!)
+splitter = RecursiveCharacterTextSplitter.from_language(
+    language=LANGUAGE,
+    chunk_size=3000,
+    chunk_overlap=400
 )
 chunks = splitter.split_documents(docs)
-print(f"✅ Split into {len(chunks)} chunks")
+print(f"✅ Split into {len(chunks)} chunks (language: {LANGUAGE.value})")
 
-# 4. Creează embeddings + stochează local
-print("🔢 Creating embeddings (this may take a while)...")
+# 4. Embed + store
+print("🔢 Creating embeddings...")
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 vectorstore = Chroma.from_documents(
     documents=chunks,
